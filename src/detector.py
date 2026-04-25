@@ -23,6 +23,60 @@ logger = logging.getLogger(__name__)
 
 CONFIDENCE_THRESHOLD = 0.75
 
+# ── Entity type blocklists ─────────────────────────────────────────────────────
+
+# spaCy-detected entity types that are never PII/PHI on their own.
+# Checks against the MAPPED entity_type (after _map_spacy_label),
+# plus original spaCy labels as fallback.
+SPACY_NON_PII_LABELS = {
+    # Mapped types
+    "LOCATION",      # from GPE, LOC — city/country alone is not PII
+    "DATE",          # from DATE — date alone is not PII
+    "NUMERIC",       # from CARDINAL — numbers are not PII
+    "FINANCIAL",     # from MONEY — revenue figures are not PII
+    "ORGANIZATION",  # from ORG — org name alone is not PII
+    "FACILITY",      # from FAC — building name alone is not PHI
+    # Original spaCy labels as fallback
+    "GPE", "LOC", "CARDINAL", "MONEY", "ORG", "FAC",
+    "TIME", "ORDINAL", "PERCENT", "QUANTITY",
+    "PRODUCT", "EVENT", "WORK_OF_ART", "LANGUAGE",
+    "LAW", "NORP",
+}
+
+# Regex-detected entity types that should be dropped before Claude
+# unless they were already gated by a keyword in the pattern itself.
+# These are inherently ambiguous without surrounding person context.
+REGEX_SKIP_WITHOUT_CONTEXT = {
+    "DATE_GENERIC",     # bare dates like 01/01/2024 are not PII alone
+    "HOSPITAL_KEYWORD", # hospital name alone is not PHI
+}
+
+# Keyword prefixes to strip from matched text
+# e.g. "SSN: 432-56-7890" → "432-56-7890"
+_KEYWORD_PREFIX_RE = re.compile(
+    r'^(?:ssn|social\s+security(?:\s+number)?|ss#|s\.s\.n\.?|'
+    r'dob|date\s+of\s+birth|born\s+on|birthdate|'
+    r'routing|aba|transit|routing\s+number|'
+    r'zip|zip\s+code|postal\s+code|'
+    r'mrn|medical\s+record\s+(?:number|#|no\.?)|'
+    r'npi|national\s+provider(?:\s+identifier)?|'
+    r'ein|employer\s+identification(?:\s+number)?|tax\s+id|'
+    r'sin|social\s+insurance(?:\s+number)?|'
+    r'tfn|tax\s+file(?:\s+number)?|'
+    r'aadhaar|aadhar|uid|'
+    r'pan|pan\s+(?:number|card)|'
+    r'passport(?:\s+number)?|pass\s+no\.?|'
+    r'dea|dea\s+number|'
+    r'member\s*id|policy\s*(?:number|#)|insurance\s*(?:id|number)|'
+    r'account\s*(?:number|#|no\.?)|acct\.?|'
+    r'ni|national\s+insurance(?:\s+number)?|'
+    r'nhs|nhs\s+number|'
+    r'vat|vat\s+(?:number|id|reg)|'
+    r'driver\'?s?\s+license|dl|license\s+number)'
+    r'[\s:#\-]*',
+    re.IGNORECASE
+)
+
 
 @dataclass
 class Entity:
@@ -72,24 +126,56 @@ class DataSentryDetector:
         start_time = time.time()
         result = DetectionResult(run_id=run_id, source_text=text)
 
-        # Layer 1
+        # Layer 1 — Regex
         regex_entities = self._layer1_regex(text)
         result.layers_used.append("regex")
 
-        # Layer 2
+        # Layer 2 — spaCy NER
         spacy_entities = self._layer2_spacy(text, existing=regex_entities)
         result.layers_used.append("spacy")
 
-        # Merge
+        # Merge all entities, resolve overlaps
         all_entities = self._merge_entities(regex_entities, spacy_entities)
 
-        # Layer 3 — escalate low confidence to Claude
+        # Layer 3 — Claude arbitration for low-confidence entities
         final_entities = []
         for ent in all_entities:
             if ent.confidence < CONFIDENCE_THRESHOLD:
+
+                # Guard 1 — drop spaCy non-PII labels before Claude
+                # Checks mapped entity_type AND original spaCy labels
+                if ent.detection_layer == "spacy" and ent.entity_type in SPACY_NON_PII_LABELS:
+                    logger.debug(
+                        "Skipping Claude for non-PII spaCy label: %s '%s'",
+                        ent.entity_type, ent.text
+                    )
+                    continue  # drop entity entirely
+
+                # Guard 2 — drop ambiguous regex entities before Claude
+                # These are inherently noisy without person context
+                if ent.detection_layer == "regex" and ent.entity_type in REGEX_SKIP_WITHOUT_CONTEXT:
+                    logger.debug(
+                        "Skipping Claude for low-value regex entity: %s '%s'",
+                        ent.entity_type, ent.text
+                    )
+                    continue  # drop entity entirely
+
                 ent = self._layer3_claude(ent, text)
                 if "claude" not in result.layers_used:
                     result.layers_used.append("claude")
+
+                # Guard 3 — drop entity if Claude says "not sensitive".
+                # claude_override == False means Claude returned is_sensitive=false.
+                # After the Claude call, entity.confidence reflects Claude's
+                # confidence in its VERDICT — so a confident rejection still has
+                # high confidence. We drop on the verdict, not the number.
+                if not ent.claude_override:
+                    logger.debug(
+                        "Claude rejected entity: %s '%s' — %s",
+                        ent.entity_type, ent.text, ent.rationale
+                    )
+                    continue  # drop from final results
+
             final_entities.append(ent)
 
         result.entities = final_entities
@@ -97,7 +183,7 @@ class DataSentryDetector:
         result.total_phi = sum(1 for e in final_entities if e.category == "PHI")
         result.processing_ms = round((time.time() - start_time) * 1000, 2)
 
-        # Layer 4
+        # Layer 4 — SQLite audit trail
         self.audit.log(result, source_label)
 
         return result
@@ -109,9 +195,16 @@ class DataSentryDetector:
         entities = []
         for pattern_def in REGEX_PATTERNS:
             for match in re.finditer(pattern_def["pattern"], text, re.IGNORECASE):
+                # Strip leading keyword labels from matched text
+                # e.g. "SSN: 432-56-7890" → "432-56-7890"
+                # e.g. "DOB: 03/15/1978" → "03/15/1978"
+                raw_text     = match.group()
+                cleaned_text = _KEYWORD_PREFIX_RE.sub('', raw_text).strip()
+                display_text = cleaned_text if cleaned_text else raw_text
+
                 entities.append(Entity(
                     entity_id=str(uuid.uuid4()),
-                    text=match.group(),
+                    text=display_text,
                     entity_type=pattern_def["entity_type"],
                     category=pattern_def["category"],
                     start=match.start(),
@@ -155,8 +248,8 @@ class DataSentryDetector:
     def _layer3_claude(self, entity, full_text):
         from src.llm import claude_arbitrate
         ctx_start = max(0, entity.start - 150)
-        ctx_end = min(len(full_text), entity.end + 150)
-        context = full_text[ctx_start:ctx_end]
+        ctx_end   = min(len(full_text), entity.end + 150)
+        context   = full_text[ctx_start:ctx_end]
 
         try:
             result = claude_arbitrate(
@@ -165,18 +258,18 @@ class DataSentryDetector:
                 context=context,
                 current_confidence=entity.confidence,
             )
-            entity.escalated = True
+            entity.escalated       = True
             entity.detection_layer = "claude"
 
             if result["is_sensitive"]:
-                entity.confidence = result["confidence"]
-                entity.entity_type = result.get("refined_type", entity.entity_type)
-                entity.category = result.get("category", entity.category)
-                entity.rationale = result["rationale"]
+                entity.confidence      = result["confidence"]
+                entity.entity_type     = result.get("refined_type", entity.entity_type)
+                entity.category        = result.get("category", entity.category)
+                entity.rationale       = result["rationale"]
                 entity.claude_override = True
             else:
-                entity.confidence = result["confidence"]
-                entity.rationale = result["rationale"]
+                entity.confidence      = result["confidence"]
+                entity.rationale       = result["rationale"]
                 entity.claude_override = False
 
         except Exception as e:
@@ -187,10 +280,13 @@ class DataSentryDetector:
 
     def _merge_entities(self, *entity_lists):
         all_ents = [e for lst in entity_lists for e in lst]
-        all_ents.sort(key=lambda e: e.confidence, reverse=True)
+        # Primary: confidence (high wins). Secondary: span length (long wins).
+        # The length tiebreak ensures keyword-gated patterns like
+        # "NHS Number: 943 476 5919" beat bare "943 476 5919" PHONE_US matches.
+        all_ents.sort(key=lambda e: (e.confidence, e.end - e.start), reverse=True)
 
         merged = []
-        taken = []
+        taken  = []
         for ent in all_ents:
             overlaps = any(
                 ent.start < t_end and ent.end > t_start
@@ -203,6 +299,13 @@ class DataSentryDetector:
         return sorted(merged, key=lambda e: e.start)
 
 
+# ── spaCy label → DataSentry entity type mapping ──────────────────────────────
+#
+# Confidence values are intentionally low for ambiguous labels (PERSON, ORG,
+# GPE) so they always hit Claude arbitration threshold and get evaluated
+# in context. SPACY_NON_PII_LABELS above drops pure location/date/number
+# detections before they even reach Claude.
+
 _SPACY_LABEL_MAP = {
     "PERSON":   {"entity_type": "PERSON_NAME",  "category": "PII", "confidence": 0.70},
     "ORG":      {"entity_type": "ORGANIZATION", "category": "PII", "confidence": 0.55},
@@ -213,6 +316,7 @@ _SPACY_LABEL_MAP = {
     "MONEY":    {"entity_type": "FINANCIAL",    "category": "PII", "confidence": 0.60},
     "FAC":      {"entity_type": "FACILITY",     "category": "PHI", "confidence": 0.55},
 }
+
 
 def _map_spacy_label(label):
     return _SPACY_LABEL_MAP.get(label)
