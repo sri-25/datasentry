@@ -6,6 +6,7 @@ Layer 3: Claude LLM arbitration (confidence < 0.75)
 Layer 4: SQLite audit trail
 """
 
+import os
 import re
 import time
 import uuid
@@ -22,6 +23,12 @@ from src.audit import AuditLogger
 logger = logging.getLogger(__name__)
 
 CONFIDENCE_THRESHOLD = 0.75
+
+# Daily Claude budget for the public demo. Guards against runaway cost
+# if the HF Space gets scraped or spammed. Resets at UTC midnight. Tracked
+# in the api_usage table — ephemeral on HF Spaces (/tmp) but persists on
+# self-hosted deployments.
+CLAUDE_DAILY_BUDGET = int(os.environ.get("CLAUDE_DAILY_BUDGET", "500"))
 
 # ── Entity type blocklists ─────────────────────────────────────────────────────
 
@@ -103,6 +110,12 @@ class DetectionResult:
     processing_ms: float = 0.0
     layers_used: list = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    # True when Claude arbitration was skipped for this run because the
+    # daily budget was exhausted. Entities below the confidence threshold
+    # are dropped in this case (conservative fallback).
+    claude_skipped_budget: bool = False
+    claude_calls_today: int = 0
+    claude_budget_daily: int = 0
 
 
 class DataSentryDetector:
@@ -137,7 +150,14 @@ class DataSentryDetector:
         # Merge all entities, resolve overlaps
         all_entities = self._merge_entities(regex_entities, spacy_entities)
 
-        # Layer 3 — Claude arbitration for low-confidence entities
+        # Layer 3 — Claude arbitration for low-confidence entities.
+        # Before entering the loop, check the daily budget once. If exhausted,
+        # we drop all Claude-eligible entities (conservative) and set a flag
+        # the UI uses to render a banner.
+        result.claude_budget_daily = CLAUDE_DAILY_BUDGET
+        result.claude_calls_today = self.audit.get_api_call_count("claude")
+        budget_exhausted = result.claude_calls_today >= CLAUDE_DAILY_BUDGET
+
         final_entities = []
         for ent in all_entities:
             if ent.confidence < CONFIDENCE_THRESHOLD:
@@ -160,7 +180,16 @@ class DataSentryDetector:
                     )
                     continue  # drop entity entirely
 
+                # Budget guard — skip Claude entirely for the rest of this run.
+                # Conservative: drop the low-confidence entity rather than
+                # passing through a noisy spaCy / low-conf regex match.
+                if budget_exhausted:
+                    result.claude_skipped_budget = True
+                    continue
+
                 ent = self._layer3_claude(ent, text)
+                # Count a successful Claude call against the daily budget
+                result.claude_calls_today = self.audit.increment_api_call("claude")
                 if "claude" not in result.layers_used:
                     result.layers_used.append("claude")
 

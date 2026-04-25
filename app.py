@@ -151,9 +151,29 @@ def render_summary_html(result, file_status):
         file_banner = (
             f'<div class="ds-banner">{html.escape(file_status)}</div>'
         )
+
+    budget_banner = ""
+    if getattr(result, "claude_skipped_budget", False):
+        budget_banner = (
+            '<div class="ds-banner ds-banner-warn">'
+            '⚡ <strong>Claude arbitration paused</strong> — daily demo budget '
+            f'reached ({result.claude_calls_today}/{result.claude_budget_daily} '
+            'calls). Low-confidence candidates were dropped; high-confidence '
+            'regex matches still shown. Resets at 00:00 UTC.'
+            '</div>'
+        )
+
     layers = " · ".join(html.escape(l) for l in result.layers_used)
+    budget_footer = ""
+    if getattr(result, "claude_budget_daily", 0):
+        calls   = getattr(result, "claude_calls_today", 0)
+        budget  = result.claude_budget_daily
+        budget_footer = (
+            f' &nbsp;·&nbsp; Claude budget: <strong>{calls}/{budget}</strong> today'
+        )
     return f"""
 {file_banner}
+{budget_banner}
 <div class="ds-tiles">
   <div class="ds-tile pii">
     <div class="ds-tile-num">{result.total_pii}</div>
@@ -172,7 +192,7 @@ def render_summary_html(result, file_status):
     <div class="ds-tile-lbl">Total entities</div>
   </div>
 </div>
-<div class="ds-meta">Layers used: <strong>{layers}</strong> &nbsp;·&nbsp; Run ID: <code>{result.run_id[:8]}</code></div>
+<div class="ds-meta">Layers used: <strong>{layers}</strong> &nbsp;·&nbsp; Run ID: <code>{result.run_id[:8]}</code>{budget_footer}</div>
 """
 
 def render_entities_html(entities):

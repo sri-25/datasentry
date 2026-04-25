@@ -198,6 +198,46 @@ def test_end_to_end_phone_keeps_paren(detector):
     )
 
 
+# ── Budget cap behaviour ──────────────────────────────────────────────────────
+
+def test_budget_counter_starts_at_zero(detector):
+    # Fresh :memory: DB each module — starting count should be 0
+    assert detector.audit.get_api_call_count("claude") == 0
+
+
+def test_budget_counter_increments(detector):
+    # Reset by calling twice and comparing
+    before = detector.audit.get_api_call_count("claude")
+    detector.audit.increment_api_call("claude")
+    after = detector.audit.get_api_call_count("claude")
+    assert after == before + 1
+
+
+def test_budget_exhausted_flag_set_when_over_limit(monkeypatch):
+    """When today's Claude count is ≥ budget, pipeline sets the skipped flag."""
+    from src import detector as det_mod
+    monkeypatch.setattr(det_mod, "CLAUDE_DAILY_BUDGET", 2)
+
+    d = det_mod.DataSentryDetector(spacy_model="en_core_web_sm", audit_db=":memory:")
+    # Pre-fill the counter to the cap
+    d.audit.increment_api_call("claude")
+    d.audit.increment_api_call("claude")
+    assert d.audit.get_api_call_count("claude") == 2
+
+    # spaCy-only input so no regex fires — forces the Claude-eligible path
+    result = d.detect("John had a meeting last Tuesday.", source_label="budget_test")
+    assert result.claude_skipped_budget is True
+    assert result.claude_calls_today >= result.claude_budget_daily
+
+
+def test_budget_not_exhausted_under_limit(monkeypatch):
+    from src import detector as det_mod
+    monkeypatch.setattr(det_mod, "CLAUDE_DAILY_BUDGET", 100)
+    d = det_mod.DataSentryDetector(spacy_model="en_core_web_sm", audit_db=":memory:")
+    result = d.detect("contact me at alice@example.com", source_label="budget_test")
+    assert result.claude_skipped_budget is False
+
+
 # ── Live Claude tests (opt-in) ────────────────────────────────────────────────
 #
 # Run with:  pytest tests/ -m live

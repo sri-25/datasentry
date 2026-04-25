@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS detected_entities (
 );
 """
 
-# ── NEW: Human-in-the-loop feedback table ─────────────────────────────────────
+# ── Human-in-the-loop feedback table ─────────────────────────────────────────
 CREATE_FEEDBACK_TABLE = """
 CREATE TABLE IF NOT EXISTS entity_feedback (
     feedback_id      TEXT PRIMARY KEY,
@@ -60,12 +60,21 @@ CREATE TABLE IF NOT EXISTS entity_feedback (
 );
 """
 
+# ── API usage table — daily budget cap for LLM arbitration ────────────────────
+CREATE_API_USAGE_TABLE = """
+CREATE TABLE IF NOT EXISTS api_usage (
+    api_name    TEXT NOT NULL,
+    call_date   TEXT NOT NULL,
+    call_count  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (api_name, call_date)
+);
+"""
+
 CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_runs_label ON detection_runs(source_label);",
     "CREATE INDEX IF NOT EXISTS idx_entities_run ON detected_entities(run_id);",
     "CREATE INDEX IF NOT EXISTS idx_entities_type ON detected_entities(entity_type);",
     "CREATE INDEX IF NOT EXISTS idx_entities_category ON detected_entities(category);",
-    # New feedback indexes
     "CREATE INDEX IF NOT EXISTS idx_feedback_run ON entity_feedback(run_id);",
     "CREATE INDEX IF NOT EXISTS idx_feedback_type ON entity_feedback(entity_type);",
     "CREATE INDEX IF NOT EXISTS idx_feedback_fp ON entity_feedback(is_false_positive);",
@@ -89,6 +98,7 @@ class AuditLogger:
         conn.execute(CREATE_RUNS_TABLE)
         conn.execute(CREATE_ENTITIES_TABLE)
         conn.execute(CREATE_FEEDBACK_TABLE)
+        conn.execute(CREATE_API_USAGE_TABLE)
         for idx in CREATE_INDEXES:
             conn.execute(idx)
         conn.commit()
@@ -98,6 +108,7 @@ class AuditLogger:
         conn.execute(CREATE_RUNS_TABLE)
         conn.execute(CREATE_ENTITIES_TABLE)
         conn.execute(CREATE_FEEDBACK_TABLE)
+        conn.execute(CREATE_API_USAGE_TABLE)
         for idx in CREATE_INDEXES:
             conn.execute(idx)
         conn.commit()
@@ -164,6 +175,42 @@ class AuditLogger:
         except sqlite3.Error as e:
             logger.error("Audit log failed for run %s: %s", result.run_id, e)
             raise
+
+    # ── API usage / budget cap ───────────────────────────────────────────────
+
+    def get_api_call_count(self, api_name="claude"):
+        """Today's UTC call count for the named API."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT call_count FROM api_usage WHERE api_name = ? AND call_date = ?",
+            (api_name, today),
+        ).fetchone()
+        self._close(conn)
+        return row["call_count"] if row else 0
+
+    def increment_api_call(self, api_name="claude"):
+        """Atomically bump today's counter for the named API; return new count."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            conn = self._conn()
+            conn.execute(
+                """INSERT INTO api_usage (api_name, call_date, call_count)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(api_name, call_date)
+                   DO UPDATE SET call_count = call_count + 1""",
+                (api_name, today),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT call_count FROM api_usage WHERE api_name = ? AND call_date = ?",
+                (api_name, today),
+            ).fetchone()
+            self._close(conn)
+            return row["call_count"] if row else 0
+        except sqlite3.Error as e:
+            logger.error("increment_api_call failed: %s", e)
+            return 0
 
     # ── Human-in-the-loop feedback ────────────────────────────────────────────
 
