@@ -5,6 +5,7 @@ DataSentry v2 — Layer 4: SQLite Audit Trail
 import sqlite3
 import json
 import logging
+import uuid
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -42,11 +43,32 @@ CREATE TABLE IF NOT EXISTS detected_entities (
 );
 """
 
+# ── NEW: Human-in-the-loop feedback table ─────────────────────────────────────
+CREATE_FEEDBACK_TABLE = """
+CREATE TABLE IF NOT EXISTS entity_feedback (
+    feedback_id      TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    entity_id        TEXT,
+    entity_text      TEXT NOT NULL,
+    entity_type      TEXT NOT NULL,
+    detection_layer  TEXT NOT NULL,
+    confidence       REAL,
+    is_false_positive INTEGER NOT NULL DEFAULT 0,
+    user_comment     TEXT,
+    timestamp        TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES detection_runs(run_id)
+);
+"""
+
 CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_runs_label ON detection_runs(source_label);",
     "CREATE INDEX IF NOT EXISTS idx_entities_run ON detected_entities(run_id);",
     "CREATE INDEX IF NOT EXISTS idx_entities_type ON detected_entities(entity_type);",
     "CREATE INDEX IF NOT EXISTS idx_entities_category ON detected_entities(category);",
+    # New feedback indexes
+    "CREATE INDEX IF NOT EXISTS idx_feedback_run ON entity_feedback(run_id);",
+    "CREATE INDEX IF NOT EXISTS idx_feedback_type ON entity_feedback(entity_type);",
+    "CREATE INDEX IF NOT EXISTS idx_feedback_fp ON entity_feedback(is_false_positive);",
 ]
 
 
@@ -54,8 +76,6 @@ class AuditLogger:
 
     def __init__(self, db_path="datasentry_audit.db"):
         self.db_path = db_path
-        # For :memory: keep one persistent connection
-        # For file-based DB open fresh connections per call
         if db_path == ":memory:":
             self._memory_conn = sqlite3.connect(":memory:")
             self._memory_conn.row_factory = sqlite3.Row
@@ -68,6 +88,7 @@ class AuditLogger:
         conn = sqlite3.connect(self.db_path)
         conn.execute(CREATE_RUNS_TABLE)
         conn.execute(CREATE_ENTITIES_TABLE)
+        conn.execute(CREATE_FEEDBACK_TABLE)
         for idx in CREATE_INDEXES:
             conn.execute(idx)
         conn.commit()
@@ -76,6 +97,7 @@ class AuditLogger:
     def _init_db_conn(self, conn):
         conn.execute(CREATE_RUNS_TABLE)
         conn.execute(CREATE_ENTITIES_TABLE)
+        conn.execute(CREATE_FEEDBACK_TABLE)
         for idx in CREATE_INDEXES:
             conn.execute(idx)
         conn.commit()
@@ -88,9 +110,10 @@ class AuditLogger:
         return conn
 
     def _close(self, conn):
-        # Never close the persistent memory connection
         if self._memory_conn is None:
             conn.close()
+
+    # ── Detection logging ──────────────────────────────────────────────────────
 
     def log(self, result, source_label):
         ts = datetime.utcnow().isoformat()
@@ -141,6 +164,109 @@ class AuditLogger:
         except sqlite3.Error as e:
             logger.error("Audit log failed for run %s: %s", result.run_id, e)
             raise
+
+    # ── Human-in-the-loop feedback ────────────────────────────────────────────
+
+    def log_feedback(self, run_id, flagged_entities):
+        """
+        Log user feedback on detected entities.
+
+        Args:
+            run_id: The run_id from the detection that produced these entities
+            flagged_entities: list of dicts with keys:
+                - entity_id   (str)
+                - entity_text (str)
+                - entity_type (str)
+                - detection_layer (str)
+                - confidence  (float)
+                - is_false_positive (bool)
+                - user_comment (str, optional)
+        """
+        if not flagged_entities:
+            return 0
+
+        ts = datetime.utcnow().isoformat()
+        try:
+            conn = self._conn()
+            count = 0
+            for ent in flagged_entities:
+                conn.execute(
+                    """INSERT INTO entity_feedback
+                       (feedback_id, run_id, entity_id, entity_text,
+                        entity_type, detection_layer, confidence,
+                        is_false_positive, user_comment, timestamp)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(uuid.uuid4()),
+                        run_id,
+                        ent.get("entity_id"),
+                        ent["entity_text"],
+                        ent["entity_type"],
+                        ent["detection_layer"],
+                        ent.get("confidence", 0.0),
+                        int(ent.get("is_false_positive", False)),
+                        ent.get("user_comment", ""),
+                        ts,
+                    )
+                )
+                count += 1
+            conn.commit()
+            self._close(conn)
+            logger.info("Logged %d feedback entries for run %s", count, run_id)
+            return count
+        except sqlite3.Error as e:
+            logger.error("Feedback log failed for run %s: %s", run_id, e)
+            return 0
+
+    def get_feedback_stats(self):
+        """
+        Returns false positive rates by entity type and detection layer.
+        Useful for identifying which patterns need improvement.
+        """
+        conn = self._conn()
+
+        # False positive rate by entity type
+        by_type = conn.execute("""
+            SELECT
+                entity_type,
+                COUNT(*) as total_feedback,
+                SUM(is_false_positive) as false_positives,
+                ROUND(100.0 * SUM(is_false_positive) / COUNT(*), 1) as fp_rate_pct
+            FROM entity_feedback
+            GROUP BY entity_type
+            ORDER BY false_positives DESC
+        """).fetchall()
+
+        # False positive rate by detection layer
+        by_layer = conn.execute("""
+            SELECT
+                detection_layer,
+                COUNT(*) as total_feedback,
+                SUM(is_false_positive) as false_positives,
+                ROUND(100.0 * SUM(is_false_positive) / COUNT(*), 1) as fp_rate_pct
+            FROM entity_feedback
+            GROUP BY detection_layer
+            ORDER BY false_positives DESC
+        """).fetchall()
+
+        # Recent false positives
+        recent_fps = conn.execute("""
+            SELECT entity_text, entity_type, detection_layer,
+                   confidence, timestamp
+            FROM entity_feedback
+            WHERE is_false_positive = 1
+            ORDER BY timestamp DESC
+            LIMIT 20
+        """).fetchall()
+
+        self._close(conn)
+        return {
+            "by_entity_type": [dict(r) for r in by_type],
+            "by_layer":       [dict(r) for r in by_layer],
+            "recent_false_positives": [dict(r) for r in recent_fps],
+        }
+
+    # ── Existing query methods ─────────────────────────────────────────────────
 
     def get_run(self, run_id):
         conn = self._conn()
@@ -194,10 +320,10 @@ class AuditLogger:
         self._close(conn)
 
         return {
-            "total_runs": stats["total_runs"],
-            "total_pii_found": stats["total_pii_found"] or 0,
-            "total_phi_found": stats["total_phi_found"] or 0,
-            "total_entities": stats["total_entities"] or 0,
+            "total_runs":        stats["total_runs"],
+            "total_pii_found":   stats["total_pii_found"] or 0,
+            "total_phi_found":   stats["total_phi_found"] or 0,
+            "total_entities":    stats["total_entities"] or 0,
             "avg_processing_ms": round(stats["avg_processing_ms"] or 0, 2),
             "escalated_to_claude": escalation_count,
             "top_entity_types": [
