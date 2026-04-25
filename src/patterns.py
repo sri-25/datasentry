@@ -38,9 +38,12 @@ REGEX_PATTERNS = [
     {
         "entity_type": "PHONE_US",
         "category": "PII",
-        "base_confidence": 0.90,
+        "base_confidence": 0.88,
         "description": "US phone number",
-        "pattern": r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b",
+        # Lookbehind (?<!\w) instead of \b so the optional `(` is captured.
+        # Confidence dropped to 0.88 so keyword-gated international IDs
+        # (NHS/SIN/TFN at 0.90+) win merge ties on bare-digit collisions.
+        "pattern": r"(?<!\w)(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b",
     },
     {
         "entity_type": "CREDIT_CARD",
@@ -134,7 +137,9 @@ REGEX_PATTERNS = [
         "category": "PII",
         "base_confidence": 0.82,
         "description": "US Driver's License — keyword triggered",
-        "pattern": r"\b(?:driver'?s?\s+license|dl|license\s+number)[\s:#]*[A-Z0-9]{6,12}\b",
+        # Allow optional 1-2 letter state code between keyword and digits.
+        # Requires at least 6 digits in the ID to avoid matching bare keywords.
+        "pattern": r"\b(?:driver'?s?\s+license|dl|license\s+(?:number|no\.?|#))(?:\s+[A-Z]{1,2})?[\s:#]*[A-Z]{0,2}\d{6,11}\b",
     },
 
     # ── US PHI — Medical ───────────────────────────────────────────────────
@@ -210,9 +215,10 @@ REGEX_PATTERNS = [
     {
         "entity_type": "UK_NHS_NUMBER",
         "category": "PHI",
-        "base_confidence": 0.90,
+        "base_confidence": 0.95,
         "description": "UK NHS Number",
         # Format: 10 digits, often written as 3-3-4
+        # Confidence high because keyword-gated — beats PHONE_US on overlapping spans.
         "pattern": r"\b(?:NHS|nhs\s+number)[\s:#]*\d{3}[-\s]?\d{3}[-\s]?\d{4}\b",
     },
     {

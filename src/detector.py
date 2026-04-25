@@ -164,11 +164,15 @@ class DataSentryDetector:
                 if "claude" not in result.layers_used:
                     result.layers_used.append("claude")
 
-                # Guard 3 — drop entity if Claude says not sensitive
-                if not ent.claude_override and ent.confidence < 0.5:
+                # Guard 3 — drop entity if Claude says "not sensitive".
+                # claude_override == False means Claude returned is_sensitive=false.
+                # After the Claude call, entity.confidence reflects Claude's
+                # confidence in its VERDICT — so a confident rejection still has
+                # high confidence. We drop on the verdict, not the number.
+                if not ent.claude_override:
                     logger.debug(
-                        "Claude rejected entity: %s '%s'",
-                        ent.entity_type, ent.text
+                        "Claude rejected entity: %s '%s' — %s",
+                        ent.entity_type, ent.text, ent.rationale
                     )
                     continue  # drop from final results
 
@@ -276,7 +280,10 @@ class DataSentryDetector:
 
     def _merge_entities(self, *entity_lists):
         all_ents = [e for lst in entity_lists for e in lst]
-        all_ents.sort(key=lambda e: e.confidence, reverse=True)
+        # Primary: confidence (high wins). Secondary: span length (long wins).
+        # The length tiebreak ensures keyword-gated patterns like
+        # "NHS Number: 943 476 5919" beat bare "943 476 5919" PHONE_US matches.
+        all_ents.sort(key=lambda e: (e.confidence, e.end - e.start), reverse=True)
 
         merged = []
         taken  = []

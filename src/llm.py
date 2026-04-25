@@ -46,9 +46,15 @@ Only flag if the text is health data AND is linked (explicitly or by context) to
   • Hospital or clinic names without patient context (City Medical Center alone)
   • Generic date ranges not tied to a person (01/01/2024, "last quarter", "this year")
   • Revenue figures, dollar amounts, financial metrics not linked to an individual
-  • Diagnosis keywords in general or research context ("diabetes affects 10% of adults")
+  • Diagnosis keywords in general, educational, marketing, or research context
+    ("diabetes affects 10% of adults", "Cancer Research Has Evolved", "Type 2
+    diabetes is a growing concern") — NO INDIVIDUAL = NOT PHI
+  • Medication names in general, educational, marketing, or research context
+    ("metformin's effect on long-term outcomes", "common drugs include lisinopril")
+    — only flag medications when explicitly prescribed/taken by a named patient
   • Product names, serial numbers, version numbers, order IDs
-  • Common words that pattern-match but carry no individual identity
+  • Common nouns that pattern-match but carry no individual identity
+    (e.g. "Medications", "Anonymous", "Patient" — these are headers/labels, not names)
   • Numbers that are clearly counts, measurements, or identifiers for non-persons
 
 ━━━ DECISION RULE ━━━
@@ -59,6 +65,40 @@ Ask yourself: "If I saw only this fragment, could I identify or re-identify a sp
 
 When uncertain — default to NOT sensitive. False negatives in edge cases are preferable
 to false positives that erode user trust in the system.
+
+━━━ WORKED EXAMPLES ━━━
+
+Example 1 — medication in research/marketing context (NOT sensitive):
+  Entity: "metformin"
+  Context: "Boston Medical Center recently published a study on metformin's effect
+            on long-term outcomes."
+  → {"is_sensitive": false, "confidence": 0.95, "category": "NONE",
+     "refined_type": "NONE", "rationale": "Medication in research context, no patient"}
+
+Example 2 — medication in patient record (IS sensitive):
+  Entity: "metformin"
+  Context: "Patient John Smith was prescribed metformin 500mg BID after his E11.9
+            diagnosis."
+  → {"is_sensitive": true, "confidence": 0.95, "category": "PHI",
+     "refined_type": "MEDICATION_PRESCRIBED", "rationale": "Medication tied to named patient"}
+
+Example 3 — common noun triggered by spaCy (NOT sensitive):
+  Entity: "Medications"
+  Context: "Medications prescribed at discharge:"
+  → {"is_sensitive": false, "confidence": 0.98, "category": "NONE",
+     "refined_type": "NONE", "rationale": "Section header, not a person name"}
+
+Example 4 — city name alone (NOT sensitive):
+  Entity: "Boston"
+  Context: "Our offices are in San Francisco, Austin, and Boston."
+  → {"is_sensitive": false, "confidence": 0.95, "category": "NONE",
+     "refined_type": "NONE", "rationale": "City name without individual linkage"}
+
+Example 5 — diagnosis in educational content (NOT sensitive):
+  Entity: "diabetes"
+  Context: "Type 2 diabetes affects roughly 37 million Americans."
+  → {"is_sensitive": false, "confidence": 0.95, "category": "NONE",
+     "refined_type": "NONE", "rationale": "Diagnosis keyword in population statistic"}
 
 ━━━ OUTPUT ━━━
 Respond ONLY with valid JSON. No preamble, no explanation, no markdown fences.
