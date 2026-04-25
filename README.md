@@ -26,6 +26,12 @@ Hybrid PII/PHI detection engine with 4-layer architecture and full audit trail.
 ## Stack
 Python 3.11 · spaCy 3.7.4 · Claude API · FastAPI · Gradio
 
+## Project docs
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — Architecture decisions with rationale
+- [`docs/METRICS.md`](docs/METRICS.md) — Measured recall, FP rate, latency, test coverage
+- [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — What DataSentry does not do, and why
+- [`docs/COVERAGE.md`](docs/COVERAGE.md) — What flags standalone vs with context
+
 ## Links
 - GitHub: https://github.com/sri-25/datasentry
 - Live Demo: https://sriDevelops-datasentry.hf.space
