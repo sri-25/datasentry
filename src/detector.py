@@ -28,7 +28,10 @@ CONFIDENCE_THRESHOLD = 0.75
 # if the HF Space gets scraped or spammed. Resets at UTC midnight. Tracked
 # in the api_usage table — ephemeral on HF Spaces (/tmp) but persists on
 # self-hosted deployments.
-CLAUDE_DAILY_BUDGET = int(os.environ.get("CLAUDE_DAILY_BUDGET", "500"))
+#
+# Worst-case at 200/day: ~$0.25/day = ~$7.50/month on Claude Haiku 4.5.
+# Override via env var if you want a different cap on a self-hosted deploy.
+CLAUDE_DAILY_BUDGET = int(os.environ.get("CLAUDE_DAILY_BUDGET", "200"))
 
 # ── Entity type blocklists ─────────────────────────────────────────────────────
 
